@@ -34,11 +34,20 @@ def merge_fact_weather_observation(spark: SparkSession, silver_df: DataFrame | N
 
     source.createOrReplaceTempView("_fact_weather_source")
     merge_predicate = " AND ".join(f"target.{c} = source.{c}" for c in MERGE_KEY_COLUMNS)
+    # Both UPDATE SET * and INSERT * fail here: they require the source to
+    # cover every target column including the generated identity column
+    # weather_observation_sk, which by definition it never will. Explicit
+    # column lists sidestep it -- the identity column is simply never
+    # mentioned, so Delta auto-generates it on insert.
+    update_columns = [c for c in source.columns if c not in ("city_id", "observation_timestamp", "_source")]
+    update_set = ", ".join(f"target.{c} = source.{c}" for c in update_columns)
+    insert_columns = ", ".join(source.columns)
+    insert_values = ", ".join(f"source.{c}" for c in source.columns)
     spark.sql(f"""
         MERGE INTO {FACT_WEATHER_TABLE} AS target
         USING _fact_weather_source AS source
         ON {merge_predicate}
-        WHEN MATCHED THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
+        WHEN MATCHED THEN UPDATE SET {update_set}
+        WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})
     """)
     return source.count()
