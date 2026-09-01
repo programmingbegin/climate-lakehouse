@@ -69,9 +69,23 @@ def parse_dly(text: str, station_id: str) -> list[dict]:
     return rows
 
 
-def fetch_pilot_stations_rows(stations: list[dict] = PILOT_STATIONS) -> list[dict]:
+def fetch_pilot_stations_rows(
+    stations: list[dict] = PILOT_STATIONS,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict]:
+    """Fetch+parse one or more stations. start_date/end_date (YYYY-MM-DD,
+    inclusive) filter the parsed rows -- the .dly file itself always holds a
+    station's full history (there's no ranged-download endpoint), so
+    "backfill for a date range" means "download full history, keep only the
+    range you asked for", not a smaller download."""
     all_rows = []
     for station in stations:
         text = fetch_station_dly(station["station_id"])
-        all_rows.extend(parse_dly(text, station["station_id"]))
+        rows = parse_dly(text, station["station_id"])
+        if start_date:
+            rows = [r for r in rows if r["obs_date"] >= start_date]
+        if end_date:
+            rows = [r for r in rows if r["obs_date"] <= end_date]
+        all_rows.extend(rows)
     return all_rows
