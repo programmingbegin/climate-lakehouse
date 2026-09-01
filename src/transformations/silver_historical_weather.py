@@ -2,6 +2,7 @@
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 BRONZE_TABLE = "workspace.bronze.ghcn_daily_raw"
 SILVER_TABLE = "workspace.silver.historical_daily_weather"
@@ -14,7 +15,12 @@ _TENTHS_ELEMENTS = ("TMAX", "TMIN", "PRCP")
 
 
 def build_silver_historical_weather(bronze_df: DataFrame) -> DataFrame:
-    return bronze_df.select(
+    """Dedup is required here (unlike a pure delta feed): each .dly pull
+    re-lands a station's FULL history, not just new days, so re-running the
+    backfill creates multiple bronze rows per (station_id, obs_date, element).
+    Without this, MERGE fails with DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW
+    -- caught via a real re-run test, not spotted in review."""
+    shaped = bronze_df.select(
         "station_id",
         "obs_date",
         F.year("obs_date").alias("obs_year"),
@@ -24,7 +30,14 @@ def build_silver_historical_weather(bronze_df: DataFrame) -> DataFrame:
         .alias("value"),
         "mflag", "qflag", "sflag",
         "_source", "_ingested_at",
-    ).withColumn("_merged_at", F.current_timestamp())
+    )
+    window = Window.partitionBy(*MERGE_KEY_COLUMNS).orderBy(F.col("_ingested_at").desc())
+    return (
+        shaped.withColumn("_rn", F.row_number().over(window))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+        .withColumn("_merged_at", F.current_timestamp())
+    )
 
 
 def merge_silver_historical_weather(spark: SparkSession, bronze_df: DataFrame | None = None) -> int:
