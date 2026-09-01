@@ -11,11 +11,23 @@ from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
+from src.quality.dq_checks import DQCheck, apply_checks, enforce_dq_gate
+
 BRONZE_TABLE = "workspace.bronze.weather_raw"
 SILVER_TABLE = "workspace.silver.weather_observations"
+DIM_CITY_CURRENT_TABLE = "workspace.gold.dim_city_current"
 QUARANTINE_TABLE = "workspace.silver.dq_quarantine"
 
 MERGE_KEY_COLUMNS = ["city_id", "observation_timestamp", "_source"]
+DQ_GATE_THRESHOLD = 0.02  # fail the run (block Gold promotion) if >2% of rows are quarantined
+
+WEATHER_CHECKS = [
+    DQCheck("not_null_city_id", "city_id IS NOT NULL"),
+    DQCheck("not_null_observation_timestamp", "observation_timestamp IS NOT NULL"),
+    DQCheck("temperature_in_range", "temperature_c IS NULL OR temperature_c BETWEEN -90 AND 60"),
+    DQCheck("freshness_48h", "observation_timestamp IS NULL OR observation_timestamp >= current_timestamp() - INTERVAL 48 HOURS"),
+    DQCheck("city_exists_in_dim_city", "_city_exists = true"),
+]
 
 _RENAME_MAP = {
     "observation_time": "observation_timestamp",
@@ -50,28 +62,29 @@ def _shape(bronze_df: DataFrame) -> DataFrame:
     )
 
 
-def split_valid_and_quarantine(bronze_df: DataFrame) -> tuple[DataFrame, DataFrame]:
-    """Inline DQ gate for Phase 1: null check on city_id, range check on
-    temperature_c (-90C to 60C covers every recorded surface temperature).
-    Real Great Expectations suites replace this in Phase 2."""
-    shaped = _shape(bronze_df).withColumn(
-        "_failure_reason",
-        F.when(F.col("city_id").isNull(), F.lit("null city_id"))
-        .when(F.col("temperature_c").isNull(), F.lit("null temperature_c"))
-        .when(~F.col("temperature_c").between(-90, 60), F.lit("temperature_c out of range [-90, 60]"))
-        .otherwise(F.lit(None)),
+def split_valid_and_quarantine(bronze_df: DataFrame, dim_city_ids: DataFrame) -> tuple[DataFrame, DataFrame]:
+    """Named DQ checks (see WEATHER_CHECKS): not-null keys, a temperature
+    range check, a freshness check, and referential integrity against
+    dim_city_current -- a reading for a city not in the dimension gets
+    quarantined with a named reason instead of silently landing with a
+    dangling FK."""
+    shaped = (
+        _shape(bronze_df)
+        .join(dim_city_ids.withColumnRenamed("city_id", "_dim_city_id"),
+              F.col("city_id") == F.col("_dim_city_id"), "left")
+        .withColumn("_city_exists", F.col("_dim_city_id").isNotNull())
+        .drop("_dim_city_id")
     )
-    valid = shaped.filter(F.col("_failure_reason").isNull()).drop("_failure_reason")
-    quarantine = shaped.filter(F.col("_failure_reason").isNotNull())
-    return valid, quarantine
+    valid, invalid = apply_checks(shaped, WEATHER_CHECKS)
+    return valid.drop("_city_exists"), invalid.drop("_city_exists")
 
 
-def build_silver_weather_observations(bronze_df: DataFrame) -> DataFrame:
+def build_silver_weather_observations(bronze_df: DataFrame, dim_city_ids: DataFrame) -> DataFrame:
     """Shape + dedupe valid bronze rows into the silver.weather_observations
     contract. Dedup keeps the most-recently-ingested row per
     (city_id, observation_timestamp, _source), so replaying/re-running the
     same ingest batch is safe."""
-    valid, _ = split_valid_and_quarantine(bronze_df)
+    valid, _ = split_valid_and_quarantine(bronze_df, dim_city_ids)
     window = Window.partitionBy(*MERGE_KEY_COLUMNS).orderBy(F.col("_ingested_at").desc())
     return (
         valid.withColumn("_rn", F.row_number().over(window))
@@ -86,8 +99,8 @@ def _quarantine_rows(quarantine_df: DataFrame, source_table: str) -> DataFrame:
     return quarantine_df.select(
         F.lit(source_table).alias("source_table"),
         key_expr.alias("natural_key"),
-        F.col("_failure_reason").alias("failure_reason"),
-        F.to_json(F.struct(*[c for c in quarantine_df.columns if c != "_failure_reason"])).alias("raw_record"),
+        F.col("failure_reason"),
+        F.to_json(F.struct(*[c for c in quarantine_df.columns if c != "failure_reason"])).alias("raw_record"),
         F.col("_ingestion_run_id"),
         F.current_timestamp().alias("quarantined_at"),
     )
@@ -98,11 +111,15 @@ def merge_silver_weather_observations(spark: SparkSession, bronze_df: DataFrame 
     silver.weather_observations keyed on (city_id, observation_timestamp,
     _source) -- upsert, never a blind append or overwrite, so re-running this
     for the same data is safe. Failing rows land in silver.dq_quarantine
-    instead of being silently dropped."""
+    with a named reason instead of being silently dropped. The Silver MERGE
+    still runs for whatever passed; the DQ gate fires *after*, so a bad batch
+    fails this task (blocking the downstream Gold tasks) rather than
+    silently promoting partial/bad data."""
     bronze_df = bronze_df if bronze_df is not None else spark.table(BRONZE_TABLE)
+    dim_city_ids = spark.table(DIM_CITY_CURRENT_TABLE).select("city_id")
 
-    _, quarantine_raw = split_valid_and_quarantine(bronze_df)
-    merged_source = build_silver_weather_observations(bronze_df)
+    _, quarantine_raw = split_valid_and_quarantine(bronze_df, dim_city_ids)
+    merged_source = build_silver_weather_observations(bronze_df, dim_city_ids)
 
     merged_source.createOrReplaceTempView("_silver_weather_source")
     merge_predicate = " AND ".join(f"target.{c} = source.{c}" for c in MERGE_KEY_COLUMNS)
@@ -118,4 +135,7 @@ def merge_silver_weather_observations(spark: SparkSession, bronze_df: DataFrame 
     if quarantine_count > 0:
         _quarantine_rows(quarantine_raw, "silver.weather_observations").write.format("delta").mode("append").saveAsTable(QUARANTINE_TABLE)
 
-    return {"merged_rows": merged_source.count(), "quarantined_rows": quarantine_count}
+    merged_count = merged_source.count()
+    enforce_dq_gate(merged_count + quarantine_count, quarantine_count, DQ_GATE_THRESHOLD, "silver.weather_observations")
+
+    return {"merged_rows": merged_count, "quarantined_rows": quarantine_count}

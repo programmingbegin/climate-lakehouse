@@ -15,5 +15,5 @@ from src.transformations.silver_historical_weather import merge_silver_historica
 
 # COMMAND ----------
 
-rows = merge_silver_historical_weather(spark)
-print(f"Merged {rows} rows into silver.historical_daily_weather")
+result = merge_silver_historical_weather(spark)
+print(f"Merged {result['merged_rows']} rows, quarantined {result['quarantined_rows']} rows into silver.historical_daily_weather")
