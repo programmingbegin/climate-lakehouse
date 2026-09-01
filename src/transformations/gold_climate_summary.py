@@ -3,27 +3,19 @@
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from src.ingestion.open_meteo import PILOT_CITIES
-
 SILVER_TABLE = "workspace.silver.weather_observations"
+DIM_CITY_CURRENT_TABLE = "workspace.gold.dim_city_current"
 GOLD_TABLE = "workspace.gold.mart_daily_city_climate_summary"
 
 MERGE_KEY_COLUMNS = ["city_id", "obs_date"]
 
 
-def build_daily_city_climate_summary(silver_df: DataFrame) -> DataFrame:
+def build_daily_city_climate_summary(silver_df: DataFrame, city_lookup: DataFrame) -> DataFrame:
     """Aggregate silver.weather_observations to one row per city per day.
     total_precip_mm sums across every poll that landed that day (this table
     is fed by repeated intraday polls, not a single daily reading).
-
-    city_name is joined from the pilot city list rather than gold.dim_city_current
-    because silver.dim_city (SCD2) isn't populated until Phase 2 -- swap this
-    join for dim_city_current once GeoNames lands."""
-    spark = silver_df.sparkSession
-    city_lookup = spark.createDataFrame(
-        [(c["city_id"], c["city_name"]) for c in PILOT_CITIES], schema=["city_id", "city_name"]
-    )
-
+    city_lookup is expected to be gold.dim_city_current (city_id, city_name)
+    in production; a small synthetic DataFrame works fine in tests."""
     aggregated = silver_df.withColumn("obs_date", F.to_date("observation_timestamp")).groupBy(
         "city_id", "obs_date"
     ).agg(
@@ -46,7 +38,8 @@ def merge_daily_city_climate_summary(spark: SparkSession, silver_df: DataFrame |
     keyed on (city_id, obs_date) -- re-aggregating a day updates that day's
     row instead of duplicating it."""
     silver_df = silver_df if silver_df is not None else spark.table(SILVER_TABLE)
-    source = build_daily_city_climate_summary(silver_df)
+    city_lookup = spark.table(DIM_CITY_CURRENT_TABLE).select("city_id", "city_name")
+    source = build_daily_city_climate_summary(silver_df, city_lookup)
 
     source.createOrReplaceTempView("_gold_daily_summary_source")
     merge_predicate = " AND ".join(f"target.{c} = source.{c}" for c in MERGE_KEY_COLUMNS)
